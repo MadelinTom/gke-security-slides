@@ -2,25 +2,38 @@
 marp: true
 theme: default
 paginate: true
-header: 'GKE Security Best Practices'
-footer: 'Multi-Tenant Cluster Architecture'
+header: 'GKE Security & Migration'
+footer: 'Multi-Tenant Cluster Architecture | Azure → GCP Migration'
 ---
 
 # GKE Security Best Practices
 ## Multi-Tenant Cluster Architecture
+## + Azure → GCP Migration Strategy
 
-*Namespace isolation, Workload Identity, and Network Design for 20+ Deployments*
+*Workshop: Security, Networking, and Cutover Planning*
 
 ---
 
 # Agenda
 
-1. **Tenant Isolation** — Namespace-per-app model
-2. **Identity & Access** — Service accounts + Workload Identity
-3. **GCP Project Structure** — App-specific projects
-4. **Network Architecture** — Ingress, LB, and API Gateway
-5. **Security Controls** — Network policies, Pod Security
-6. **Recommendations** — Decision matrix for 20 deployments
+**Part 1: GKE Multi-Tenancy**
+1. Namespace isolation & Workload Identity
+2. Network architecture for 20 deployments
+
+**Part 2: Cross-Cloud Networking**
+3. Azure ↔ GCP connectivity options
+4. DNS, Firewall rules, GCP service ranges
+
+**Part 3: Migration & Cutover**
+5. App/API cutover strategies
+6. On-premises LDAP integration
+
+---
+
+<!-- _class: lead -->
+
+# Part 1
+## GKE Multi-Tenancy
 
 ---
 
@@ -47,48 +60,7 @@ cluster/
 
 ---
 
-# Namespace Best Practices
-
-| Practice | Implementation |
-|----------|---------------|
-| Naming convention | `app-{name}` or `{team}-{app}` |
-| Labels | `app`, `team`, `env`, `cost-center` |
-| Resource quotas | CPU/memory limits per namespace |
-| Limit ranges | Default container limits |
-| Network policies | Deny-all default, explicit allow |
-
-```yaml
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: app-orders
-  labels:
-    app: orders
-    team: platform
-    env: prod
-```
-
----
-
-# Identity: Service Account Per App
-
-## The Problem with Default SA
-
-❌ Shared `default` SA across apps = blast radius  
-❌ Overprivileged access  
-❌ No audit trail per app  
-
-## The Solution
-
-✅ **Dedicated K8s SA per app**  
-✅ **Dedicated GCP SA per app**  
-✅ **Workload Identity binding**  
-
----
-
-# Workload Identity Federation (WIF)
-
-## How It Works
+# Identity: Workload Identity Federation
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -97,7 +69,6 @@ metadata:
 │  │ Pod (app-orders) │                               │
 │  │ SA: orders-sa    │ ──────┐                       │
 │  └──────────────────┘       │ WIF                   │
-│                              ▼                       │
 └───────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -108,33 +79,11 @@ metadata:
 └─────────────────────────────────────────────────────┘
 ```
 
----
-
-# WIF Configuration
-
-```yaml
-# 1. K8s ServiceAccount
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: orders-sa
-  namespace: app-orders
-  annotations:
-    iam.gke.io/gcp-service-account: orders-app@proj.iam.gserviceaccount.com
----
-# 2. GCP IAM binding (Terraform)
-resource "google_service_account_iam_member" "workload_identity" {
-  service_account_id = google_service_account.orders.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = "serviceAccount:PROJECT.svc.id.goog[app-orders/orders-sa]"
-}
-```
+**Per-app isolation:** K8s SA → GCP SA → Least privilege IAM
 
 ---
 
-# Project Structure for Dependencies
-
-## App-Specific GCP Projects
+# Project Structure
 
 ```
 org/
@@ -144,303 +93,663 @@ org/
 │   ├── Cloud Storage
 │   └── Pub/Sub topics
 ├── app-inventory-prod/         # Inventory app resources
-├── app-payments-prod/          # Payments app resources
-└── shared-services-prod/       # Shared infra (logging, etc.)
+└── shared-services-prod/       # Logging, monitoring
 ```
-
-**Benefits:**
-- Billing isolation
-- IAM boundary per app
-- Resource quota per project
-- Separate audit logs
-
----
-
-# Shared vs Dedicated Projects
 
 | Resource Type | Recommendation |
 |---------------|----------------|
-| GKE Cluster | Shared (platform-gke) |
+| GKE Cluster | Shared (platform project) |
 | Cloud SQL | Dedicated per app |
-| Pub/Sub | Dedicated or shared topic project |
-| Cloud Storage | Dedicated per app |
 | Secret Manager | Dedicated per app |
 | VPC/Networking | Shared (host project) |
 
-**Rule of thumb:** Anything with app data = dedicated project
-
 ---
 
-# Network Architecture: 20 Deployments
-
-## The Challenge
-
-- 20 backend API deployments
-- All need external exposure
-- Security + cost optimization
-- Observability
-
-## Options
-
-1. **Single Ingress Controller** (recommended)
-2. **Cloud Load Balancer per service** (expensive)
-3. **API Gateway** (depends on needs)
-
----
-
-# Option 1: Single Ingress (Recommended)
+# Network: Single Ingress for 20 APIs
 
 ```
                     ┌──────────────────────┐
                     │   Cloud Load Balancer │
-                    │   (single external IP) │
+                    │   + Cloud Armor (WAF) │
                     └──────────┬───────────┘
                                │
                     ┌──────────▼───────────┐
-                    │   Ingress Controller  │
-                    │   (GKE Ingress/NGINX) │
+                    │   GKE Gateway API     │
+                    │   (path-based routing)│
                     └──────────┬───────────┘
-                               │
         ┌──────────┬───────────┼───────────┬──────────┐
         ▼          ▼           ▼           ▼          ▼
-   app-orders  app-inventory  app-payments  ...   app-20
-   ClusterIP   ClusterIP      ClusterIP          ClusterIP
+   /orders    /inventory   /payments    /users    /app-20
+```
+
+**Cost:** 1 LB vs 20 = significant savings
+**Recommendation:** Skip API Gateway unless you need monetization
+
+---
+
+<!-- _class: lead -->
+
+# Part 2
+## Cross-Cloud Networking
+### Azure ↔ GCP Connectivity
+
+---
+
+# Connectivity Options
+
+| Option | Latency | Bandwidth | Cost | Complexity |
+|--------|---------|-----------|------|------------|
+| **VPN (HA)** | ~50ms | 3 Gbps | $ | Low |
+| **Dedicated Interconnect** | ~10ms | 10-100 Gbps | $$$ | High |
+| **Partner Interconnect** | ~20ms | 50 Mbps-10 Gbps | $$ | Medium |
+| **Internet (Public)** | Variable | N/A | $ | Low |
+
+## 💬 Discussion Point
+*What's your latency tolerance during migration? 
+How much cross-cloud traffic do you expect?*
+
+---
+
+# Option 1: HA VPN (Recommended for Migration)
+
+```
+┌─────────────────────┐                    ┌─────────────────────┐
+│      Azure VNet     │                    │       GCP VPC       │
+│   10.1.0.0/16       │                    │    10.2.0.0/16      │
+│                     │                    │                     │
+│  ┌───────────────┐  │    IPsec Tunnels   │  ┌───────────────┐  │
+│  │ VPN Gateway   │◄─┼────────────────────┼─►│ Cloud VPN     │  │
+│  │ (Active-Active)│ │    (4 tunnels)     │  │ (HA Gateway)  │  │
+│  └───────────────┘  │                    │  └───────────────┘  │
+│                     │                    │                     │
+│  Azure Apps         │                    │  GKE Cluster        │
+└─────────────────────┘                    └─────────────────────┘
+```
+
+**Throughput:** 3 Gbps per tunnel (12 Gbps with 4 tunnels)
+**SLA:** 99.99% with HA configuration
+
+---
+
+# VPN Configuration
+
+## Azure Side
+```bash
+# Create VPN Gateway (takes ~45 mins)
+az network vnet-gateway create \
+  --name azure-vpn-gw \
+  --resource-group rg-network \
+  --vnet hub-vnet \
+  --gateway-type Vpn \
+  --vpn-type RouteBased \
+  --sku VpnGw2 \
+  --generation Generation2
+```
+
+## GCP Side
+```bash
+# Create HA VPN Gateway
+gcloud compute vpn-gateways create gcp-vpn-gw \
+  --network=shared-vpc \
+  --region=australia-southeast1
 ```
 
 ---
 
-# GKE Gateway API (Modern Approach)
+# Option 2: Dedicated Interconnect
 
-```yaml
-apiVersion: gateway.networking.k8s.io/v1
-kind: Gateway
-metadata:
-  name: external-gateway
-spec:
-  gatewayClassName: gke-l7-global-external-managed
-  listeners:
-  - name: https
-    port: 443
-    protocol: HTTPS
+```
+┌──────────────┐     ┌─────────────────────┐     ┌──────────────┐
+│    Azure     │     │   Colocation Facility │     │     GCP      │
+│              │     │   (e.g., Equinix SY1) │     │              │
+│  ExpressRoute├────►│                       │◄────┤ Interconnect │
+│              │     │  Cross-connect fiber  │     │              │
+└──────────────┘     └─────────────────────────┘     └──────────────┘
+```
+
+**Best for:** High-bandwidth, low-latency requirements
+**Lead time:** 2-4 weeks for provisioning
+**Cost:** $1,700/month per 10 Gbps port + colo fees
+
+## 💬 Discussion Point
+*Is the extra cost/complexity justified for your traffic patterns?*
+
 ---
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
-metadata:
-  name: orders-route
-  namespace: app-orders
-spec:
-  parentRefs:
-  - name: external-gateway
-  hostnames: ["api.example.com"]
-  rules:
-  - matches:
-    - path: {type: PathPrefix, value: "/orders"}
-    backendRefs:
-    - name: orders-service
-      port: 8080
+
+# IP Address Planning
+
+## Non-Overlapping CIDR Ranges
+
+| Environment | Azure CIDR | GCP CIDR |
+|-------------|------------|----------|
+| Production | 10.1.0.0/16 | 10.2.0.0/16 |
+| Non-Prod | 10.11.0.0/16 | 10.12.0.0/16 |
+| Management | 10.100.0.0/24 | 10.100.1.0/24 |
+
+## GKE-Specific Ranges
+```
+Pod CIDR:     10.2.0.0/14   (262,144 IPs)
+Service CIDR: 10.6.0.0/20   (4,096 IPs)
+Master CIDR:  172.16.0.0/28 (Private endpoint)
+```
+
+⚠️ **Critical:** Ensure no overlap with Azure or on-prem ranges
+
+---
+
+# DNS Architecture
+
+## Hybrid DNS Resolution
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                     On-Premises DNS                            │
+│                   (Active Directory)                           │
+│                  corp.example.com                               │
+└───────────────────────────┬────────────────────────────────────┘
+                            │ Conditional forwarding
+        ┌───────────────────┴───────────────────┐
+        ▼                                       ▼
+┌───────────────────┐                 ┌───────────────────┐
+│   Azure DNS       │                 │   GCP Cloud DNS   │
+│ Private Zones     │                 │   Private Zones   │
+│                   │                 │                   │
+│ *.azure.internal  │◄───────────────►│ *.gcp.internal    │
+│ *.database.azure  │   Forwarding    │ *.pkg.dev         │
+└───────────────────┘                 └───────────────────┘
 ```
 
 ---
 
-# Do You Need API Gateway?
+# DNS Configuration
 
-## Use GKE Ingress When:
-- ✅ Simple path-based routing
-- ✅ TLS termination
-- ✅ Basic rate limiting (via annotations)
-- ✅ 20 internal backend APIs
+## GCP Cloud DNS Private Zone
+```bash
+# Create private zone for GCP resources
+gcloud dns managed-zones create gcp-internal \
+  --dns-name="gcp.internal." \
+  --visibility=private \
+  --networks=shared-vpc
 
-## Use API Gateway (Apigee/Cloud Endpoints) When:
-- 🔶 API monetization/quotas per client
-- 🔶 OAuth/API key management
-- 🔶 Request/response transformation
-- 🔶 Developer portal needed
-- 🔶 Multi-cloud API facade
+# Forwarding zone for Azure resolution
+gcloud dns managed-zones create azure-forward \
+  --dns-name="azure.internal." \
+  --visibility=private \
+  --networks=shared-vpc \
+  --forwarding-targets="10.1.0.4,10.1.0.5"  # Azure DNS IPs
+```
+
+## Azure DNS Forwarding
+```powershell
+# Conditional forwarder for GCP
+Add-DnsServerConditionalForwarderZone `
+  -Name "gcp.internal" `
+  -MasterServers 10.2.0.2  # GCP DNS inbound endpoint
+```
 
 ---
 
-# Recommendation for 20 Backend APIs
+# Firewall Rules: GCP Side
 
-## **Use GKE Gateway API + Internal Load Balancer**
+## Required Ingress Rules
+
+| Priority | Source | Destination | Ports | Purpose |
+|----------|--------|-------------|-------|---------|
+| 1000 | Azure VNet (10.1.0.0/16) | GKE Nodes | 443, 8080 | API traffic |
+| 1000 | Azure VNet | Cloud SQL | 5432, 3306 | Database |
+| 1000 | On-prem (10.100.0.0/24) | All | 22 | SSH mgmt |
+| 65534 | 0.0.0.0/0 | All | All | Deny all |
+
+```bash
+gcloud compute firewall-rules create allow-azure-to-gke \
+  --network=shared-vpc \
+  --allow=tcp:443,tcp:8080 \
+  --source-ranges=10.1.0.0/16 \
+  --target-tags=gke-node
+```
+
+---
+
+# GCP Service Ranges to Allow
+
+## Outbound from Azure to GCP Services
+
+| Service | Range/Domain | Port |
+|---------|--------------|------|
+| GKE API | 142.250.0.0/15 or *.googleapis.com | 443 |
+| Cloud SQL | Private IP in VPC | 5432/3306 |
+| Cloud Storage | *.storage.googleapis.com | 443 |
+| Artifact Registry | *.pkg.dev | 443 |
+| Cloud Logging | logging.googleapis.com | 443 |
+| IAM/Auth | *.googleapis.com | 443 |
+
+## 💬 Discussion Point
+*Private Google Access vs Internet egress for GCP APIs?*
+
+---
+
+# Private Google Access
+
+## Keep Traffic Off Public Internet
 
 ```
-Internet
+┌─────────────────────────────────────────────────────────────┐
+│ GCP VPC (Private Google Access Enabled)                     │
+│                                                             │
+│  GKE Pod ──► 199.36.153.8/30 ──► googleapis.com             │
+│             (private.googleapis.com)                        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+```bash
+# Enable Private Google Access on subnet
+gcloud compute networks subnets update gke-subnet \
+  --region=australia-southeast1 \
+  --enable-private-ip-google-access
+```
+
+**Benefit:** No public IPs needed for GCP API access
+
+---
+
+<!-- _class: lead -->
+
+# Part 3
+## Migration & Cutover Strategy
+
+---
+
+# Cutover Patterns
+
+## Option A: Big Bang 💥
+- All apps cut over at once
+- Single maintenance window
+- High risk, high coordination
+
+## Option B: Strangler Fig 🌿 (Recommended)
+- Migrate one app at a time
+- Route traffic progressively
+- Rollback per-app if needed
+
+## Option C: Blue-Green 🔵🟢
+- Full parallel environment
+- DNS switch at cutover
+- Highest cost, lowest risk
+
+---
+
+# Strangler Fig Pattern
+
+```
+Phase 1: 10% Traffic          Phase 2: 50% Traffic         Phase 3: 100% Traffic
+┌──────────────────┐          ┌──────────────────┐         ┌──────────────────┐
+│   Load Balancer  │          │   Load Balancer  │         │   Load Balancer  │
+└────────┬─────────┘          └────────┬─────────┘         └────────┬─────────┘
+         │                             │                            │
+    ┌────┴────┐                   ┌────┴────┐                       │
+    ▼         ▼                   ▼         ▼                       ▼
+┌──────┐  ┌──────┐           ┌──────┐  ┌──────┐              ┌──────────┐
+│Azure │  │ GCP  │           │Azure │  │ GCP  │              │   GCP    │
+│ 90%  │  │ 10%  │           │ 50%  │  │ 50%  │              │  100%    │
+└──────┘  └──────┘           └──────┘  └──────┘              └──────────┘
+```
+
+**Tools:** Traffic Manager (Azure), Cloud Load Balancing, Weighted routing
+
+---
+
+# API Cutover Strategy
+
+## Per-API Migration Runbook
+
+| Step | Action | Rollback |
+|------|--------|----------|
+| 1 | Deploy to GKE (shadow mode) | Delete deployment |
+| 2 | Synthetic traffic testing | N/A |
+| 3 | 10% canary traffic | Route 100% Azure |
+| 4 | Monitor error rates/latency | Route 100% Azure |
+| 5 | 50% traffic split | Route 100% Azure |
+| 6 | 100% to GCP | Route 100% Azure |
+| 7 | Decommission Azure | N/A |
+
+**Monitoring:** Error rate < 0.1%, P99 latency within SLO
+
+---
+
+# Traffic Routing Options
+
+## Option 1: DNS-Based (Simple)
+
+```
+api.example.com
     │
     ▼
-┌───────────────────┐
-│ Cloud Armor (WAF) │
-└─────────┬─────────┘
-          ▼
-┌───────────────────┐
-│ External Gateway  │ ← Single entry point
-└─────────┬─────────┘
-          ▼
-┌───────────────────┐
-│ 20 HTTPRoutes     │ ← Path-based routing
-│ (one per app)     │
-└───────────────────┘
+┌─────────────────────────────┐
+│ Azure Traffic Manager       │
+│ or                          │
+│ Cloud DNS (weighted routing)│
+└─────────────────────────────┘
+    │
+    ├──► Azure App Service (weight: 50)
+    │
+    └──► GCP Load Balancer (weight: 50)
 ```
 
-**Cost:** 1 LB vs 20 LBs = significant savings
+**Pros:** Simple, works everywhere
+**Cons:** DNS TTL delays, no request-level control
 
 ---
 
-# Network Policies: Default Deny
+# Traffic Routing Options
 
-```yaml
-# Default deny all ingress in namespace
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: default-deny-ingress
-  namespace: app-orders
-spec:
-  podSelector: {}
-  policyTypes:
-  - Ingress
+## Option 2: Global Load Balancer (Recommended)
+
+```
+                    ┌────────────────────────┐
+                    │ GCP Global LB          │
+                    │ (External HTTP(S))     │
+                    └───────────┬────────────┘
+                                │
+                    ┌───────────┴───────────┐
+                    │   Traffic Director    │
+                    │   (header/weight)     │
+                    └───────────┬───────────┘
+                                │
+              ┌─────────────────┼─────────────────┐
+              ▼                 ▼                 ▼
+    ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
+    │ Azure Backend   │ │ GKE Backend     │ │ GKE Backend     │
+    │ (NEG)           │ │ (orders)        │ │ (inventory)     │
+    └─────────────────┘ └─────────────────┘ └─────────────────┘
+```
+
+**Pros:** Request-level routing, header-based canary, single IP
+
 ---
-# Allow from ingress controller only
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: allow-ingress-controller
-spec:
-  podSelector:
-    matchLabels:
-      app: orders
-  ingress:
-  - from:
-    - namespaceSelector:
-        matchLabels:
-          name: ingress-nginx
+
+# Cutover Checklist
+
+## Pre-Cutover
+- [ ] Synthetic tests passing on GCP
+- [ ] Monitoring/alerting configured
+- [ ] Runbook documented
+- [ ] Rollback tested
+- [ ] Stakeholder comms sent
+
+## During Cutover
+- [ ] Start with 10% traffic
+- [ ] Monitor for 30 mins
+- [ ] Increment to 50%, monitor
+- [ ] Increment to 100%
+
+## Post-Cutover
+- [ ] Confirm all traffic on GCP
+- [ ] Keep Azure running 48-72h
+- [ ] Decommission Azure resources
+
+---
+
+# Database Cutover
+
+## Options for Stateful Workloads
+
+| Pattern | Downtime | Complexity | Data Loss Risk |
+|---------|----------|------------|----------------|
+| **Dump & Restore** | Hours | Low | Medium |
+| **Replication** | Minutes | Medium | Low |
+| **DMS (Database Migration Service)** | Minutes | Low | Low |
+| **Dual-Write** | Zero | High | Medium |
+
+## 💬 Discussion Point
+*What's your acceptable downtime window?
+Any active-active requirements?*
+
+---
+
+<!-- _class: lead -->
+
+# Part 4
+## On-Premises LDAP Integration
+
+---
+
+# LDAP Integration Options
+
+## Option 1: Cloud Identity + LDAP Sync
+```
+On-Prem AD/LDAP ──► Google Cloud Directory Sync ──► Cloud Identity
+                          (scheduled sync)
+```
+
+## Option 2: Workload Identity + Direct LDAP
+```
+GKE Pod ──► VPN ──► On-Prem LDAP (port 389/636)
+```
+
+## Option 3: LDAP Proxy in GCP
+```
+GKE Pod ──► LDAP Proxy (GCE) ──► VPN ──► On-Prem LDAP
 ```
 
 ---
 
-# Cross-Namespace Communication
+# Option 1: Google Cloud Directory Sync
 
-## Service-to-Service Policies
+## Best for: User Authentication
 
-```yaml
-# Allow orders to call inventory
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: allow-from-orders
-  namespace: app-inventory
-spec:
-  podSelector:
-    matchLabels:
-      app: inventory
-  ingress:
-  - from:
-    - namespaceSelector:
-        matchLabels:
-          app: orders
-    ports:
-    - port: 8080
 ```
-
-**Principle:** Explicit allow, deny everything else
+┌──────────────────────────────────────────────────────────────┐
+│                     On-Premises                              │
+│  ┌─────────────┐      ┌─────────────────────────────────┐   │
+│  │ AD / LDAP   │◄────►│ Google Cloud Directory Sync     │   │
+│  │             │      │ (runs on Windows server)        │   │
+│  └─────────────┘      └───────────────┬─────────────────┘   │
+└───────────────────────────────────────┼─────────────────────┘
+                                        │ HTTPS (443)
+                                        ▼
+                            ┌───────────────────────┐
+                            │   Google Cloud        │
+                            │   Identity            │
+                            └───────────────────────┘
+                                        │
+                                        ▼
+                            ┌───────────────────────┐
+                            │   GKE / IAP /         │
+                            │   Cloud Console       │
+                            └───────────────────────┘
+```
 
 ---
 
-# Pod Security Standards
+# GCDS Configuration
 
 ```yaml
+# Example GCDS config
+ldap:
+  hostname: ldap.corp.example.com
+  port: 636
+  ssl: true
+  baseDn: DC=corp,DC=example,DC=com
+  
+google:
+  domain: example.com
+  adminEmail: admin@example.com
+  
+sync:
+  users:
+    filter: "(&(objectClass=user)(memberOf=CN=GCP-Users,OU=Groups,DC=corp,DC=example,DC=com))"
+    attributes:
+      email: mail
+      firstName: givenName
+      lastName: sn
+  groups:
+    filter: "(objectClass=group)"
+```
+
+**Sync frequency:** Every 1-4 hours (configurable)
+
+---
+
+# Option 2: Direct LDAP from GKE
+
+## For Application-Level Auth (e.g., API auth)
+
+```yaml
+# Kubernetes Secret for LDAP bind credentials
 apiVersion: v1
-kind: Namespace
+kind: Secret
 metadata:
-  name: app-orders
-  labels:
-    pod-security.kubernetes.io/enforce: restricted
-    pod-security.kubernetes.io/audit: restricted
-    pod-security.kubernetes.io/warn: restricted
+  name: ldap-credentials
+  namespace: app-orders
+type: Opaque
+stringData:
+  bind-dn: "CN=svc-gke-ldap,OU=Service Accounts,DC=corp,DC=example,DC=com"
+  bind-password: "your-password"
+---
+# Application config
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ldap-config
+data:
+  LDAP_HOST: "ldap.corp.example.com"
+  LDAP_PORT: "636"
+  LDAP_BASE_DN: "DC=corp,DC=example,DC=com"
+  LDAP_USER_FILTER: "(sAMAccountName={0})"
 ```
 
-## Restricted Profile Requires:
-- Non-root user
-- Read-only root filesystem
-- No privilege escalation
-- Dropped capabilities
-- Seccomp profile
+---
+
+# Firewall Rules for LDAP
+
+## GCP to On-Prem (via VPN)
+
+| Source | Destination | Port | Protocol |
+|--------|-------------|------|----------|
+| GKE Pod CIDR | LDAP Server | 389 | TCP (LDAP) |
+| GKE Pod CIDR | LDAP Server | 636 | TCP (LDAPS) |
+| GKE Pod CIDR | AD DC | 88 | TCP/UDP (Kerberos) |
+| GKE Pod CIDR | AD DC | 464 | TCP/UDP (Kerberos pwd) |
+
+```bash
+# On-prem firewall (example)
+az network nsg rule create \
+  --name allow-gke-ldap \
+  --nsg-name on-prem-nsg \
+  --priority 100 \
+  --source-address-prefixes 10.2.0.0/14 \
+  --destination-port-ranges 636 \
+  --protocol Tcp
+```
+
+---
+
+# Option 3: LDAP Proxy (Recommended)
+
+## Benefits of a Proxy Layer
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│ GCP VPC                                                        │
+│                                                                │
+│  ┌─────────────┐        ┌─────────────────┐                   │
+│  │ GKE Pods    │───────►│ LDAP Proxy      │                   │
+│  │             │        │ (GCE or GKE)    │                   │
+│  └─────────────┘        │                 │                   │
+│                         │ - Connection    │                   │
+│                         │   pooling       │                   │
+│                         │ - TLS termination│                   │
+│                         │ - Caching       │                   │
+│                         │ - Failover      │                   │
+│                         └────────┬────────┘                   │
+└──────────────────────────────────┼────────────────────────────┘
+                                   │ VPN
+                                   ▼
+                         ┌─────────────────┐
+                         │ On-Prem LDAP    │
+                         └─────────────────┘
+```
+
+---
+
+# LDAP Decision Matrix
+
+| Requirement | GCDS | Direct LDAP | LDAP Proxy |
+|-------------|------|-------------|------------|
+| User SSO to GCP Console | ✅ | ❌ | ❌ |
+| Application auth | ⚠️ | ✅ | ✅ |
+| Real-time auth | ❌ | ✅ | ✅ |
+| Connection pooling | N/A | ❌ | ✅ |
+| High availability | ✅ | ⚠️ | ✅ |
+| Complexity | Low | Low | Medium |
+
+## 💬 Discussion Point
+*What's your primary LDAP use case?
+- User SSO to GCP services?
+- Application-level authentication?
+- Both?*
 
 ---
 
 # Complete Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                         Internet                             │
-└──────────────────────────┬──────────────────────────────────┘
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│ Cloud Armor (WAF) + Cloud CDN                               │
-└──────────────────────────┬──────────────────────────────────┘
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│ GKE Gateway (External LB) - Single IP                       │
-└──────────────────────────┬──────────────────────────────────┘
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│ GKE Cluster (platform-gke-prod)                             │
-│  ┌─────────┐ ┌─────────┐ ┌─────────┐     ┌─────────┐       │
-│  │app-orders│ │app-inv  │ │app-pay  │ ... │app-20   │       │
-│  │ NS + SA  │ │ NS + SA │ │ NS + SA │     │ NS + SA │       │
-│  │ NetPol   │ │ NetPol  │ │ NetPol  │     │ NetPol  │       │
-│  └────┬─────┘ └────┬────┘ └────┬────┘     └────┬────┘       │
-│       │ WIF        │ WIF       │ WIF           │ WIF        │
-└───────┼────────────┼───────────┼───────────────┼────────────┘
-        ▼            ▼           ▼               ▼
-┌─────────────┐ ┌─────────┐ ┌─────────┐    ┌─────────┐
-│orders-proj  │ │inv-proj │ │pay-proj │    │app20-proj│
-│ SQL, GCS    │ │ SQL     │ │ SQL     │    │ ...      │
-└─────────────┘ └─────────┘ └─────────┘    └──────────┘
+┌───────────────────────────────────────────────────────────────────────────┐
+│                              Internet                                      │
+└─────────────────────────────────┬─────────────────────────────────────────┘
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     GCP Global Load Balancer + Cloud Armor                   │
+└─────────────────────────────────┬─────────────────────────────────────────────┘
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ GKE Cluster (platform-gke-prod)              │ Azure (during migration)    │
+│  ┌─────────┐ ┌─────────┐ ┌─────────┐        │  ┌─────────────────────┐     │
+│  │app-orders│ │app-inv  │ │app-pay  │        │  │ Legacy Apps         │     │
+│  │ WIF+SA  │ │ WIF+SA  │ │ WIF+SA  │        │  │ (traffic split)     │     │
+│  └────┬────┘ └────┬────┘ └────┬────┘        │  └─────────────────────┘     │
+└───────┼──────────────────────────────────────┼─────────────────────────────┘
+        │ VPN (HA)                             │
+        ▼                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           On-Premises                                        │
+│   ┌──────────────┐    ┌──────────────┐    ┌──────────────┐                  │
+│   │ LDAP / AD    │    │  DNS         │    │  Databases   │                  │
+│   └──────────────┘    └──────────────┘    └──────────────┘                  │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-# Security Checklist
+# Summary & Recommendations
 
-| Control | Implementation |
-|---------|---------------|
-| ✅ Namespace isolation | 1 namespace per app |
-| ✅ RBAC | Team-scoped roles per namespace |
-| ✅ Workload Identity | K8s SA → GCP SA per app |
-| ✅ Network policies | Default deny + explicit allow |
-| ✅ Pod Security | Restricted PSS enforcement |
-| ✅ Secrets | External Secrets + Secret Manager |
-| ✅ Ingress | Single Gateway, path routing |
-| ✅ WAF | Cloud Armor on external LB |
-| ✅ Audit | GKE audit logs → Cloud Logging |
+| Topic | Recommendation |
+|-------|----------------|
+| **Cross-Cloud** | HA VPN (start), Interconnect if >3 Gbps needed |
+| **DNS** | Cloud DNS private zones + conditional forwarding |
+| **Firewall** | Explicit allow, deny-all default |
+| **Cutover** | Strangler Fig with weighted traffic routing |
+| **LDAP** | GCDS for SSO + Proxy for app auth |
 
 ---
 
-# Decision Matrix: API Gateway vs Ingress
+# Discussion Points
 
-| Requirement | Ingress | API Gateway |
-|-------------|---------|-------------|
-| Path routing | ✅ | ✅ |
-| TLS termination | ✅ | ✅ |
-| Rate limiting | ⚠️ Basic | ✅ Advanced |
-| API keys/OAuth | ❌ | ✅ |
-| Request transform | ❌ | ✅ |
-| Analytics/Monetization | ❌ | ✅ |
-| Cost (20 APIs) | $ | $$$ |
-| Complexity | Low | High |
-
-**For 20 internal backend APIs: Use GKE Ingress/Gateway**
+1. **Connectivity:** VPN vs Interconnect based on your traffic patterns?
+2. **Cutover window:** What's acceptable downtime for database migration?
+3. **LDAP scope:** SSO only, or application authentication too?
+4. **Traffic routing:** DNS-based or Global LB for canary?
+5. **Rollback SLA:** How quickly do you need to fail back to Azure?
 
 ---
 
-# Summary
+# Next Steps
 
-1. **Namespace per app** — Logical isolation + RBAC boundary
-2. **Service Account per app** — K8s SA + GCP SA via WIF
-3. **Project per app** — Data isolation + billing clarity
-4. **Single Ingress** — Cost effective for 20 deployments
-5. **Network Policies** — Default deny, explicit allow
-6. **Skip API Gateway** — Unless you need monetization/dev portal
+1. 📋 **Document current state** — Network topology, app inventory
+2. 🔌 **Establish VPN connectivity** — Test throughput and latency
+3. 🧪 **Pilot migration** — Single low-risk app end-to-end
+4. 📊 **Define SLOs** — Error rates, latency thresholds for cutover
+5. 📅 **Cutover schedule** — App-by-app timeline with stakeholders
 
 ---
 
@@ -449,5 +758,6 @@ metadata:
 📧 Contact: [your-email]
 📚 Resources:
 - [GKE Best Practices](https://cloud.google.com/kubernetes-engine/docs/best-practices)
-- [Workload Identity](https://cloud.google.com/kubernetes-engine/docs/concepts/workload-identity)
-- [Gateway API](https://cloud.google.com/kubernetes-engine/docs/concepts/gateway-api)
+- [Cloud VPN](https://cloud.google.com/network-connectivity/docs/vpn)
+- [Cloud Directory Sync](https://support.google.com/a/answer/106368)
+- [Database Migration Service](https://cloud.google.com/database-migration)
