@@ -1341,6 +1341,1013 @@ gcloud database-migration migration-jobs create azure-to-cloudsql \
 
 ---
 
+<!-- _class: lead -->
+
+# Part 7
+## VM Migration Strategy
+### Migrate for Compute Engine (M4CE)
+
+---
+
+# VM Migration Approaches
+
+| Approach | Downtime | Complexity | Best For |
+|----------|----------|------------|----------|
+| **Lift & Shift (M4CE)** | Minutes | Low | Most VMs |
+| **Cold Migration** | Hours | Low | Dev/Test |
+| **Replatform** | Days | Medium | Optimization |
+| **Rebuild** | Weeks | High | Modernization |
+
+## Decision Framework
+```
+Is the app containerizable?
+├─ Yes → GKE migration (Part 3)
+└─ No → Continue with VM migration
+         ├─ Tight cutover window? → M4CE (warm)
+         └─ Flexible timeline? → Cold or replatform
+```
+
+---
+
+# Migrate for Compute Engine (M4CE)
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        GCP (Target)                                      │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │              Migrate for Compute Engine                          │  │
+│  │   ┌─────────────┐    ┌─────────────┐    ┌─────────────┐         │  │
+│  │   │ Migrate     │    │ Cloud       │    │ Target      │         │  │
+│  │   │ Connector   │◄──►│ Extensions  │───►│ GCE VMs     │         │  │
+│  │   │ (on Azure)  │    │             │    │             │         │  │
+│  │   └─────────────┘    └─────────────┘    └─────────────┘         │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+                    ▲
+                    │ Replication
+                    ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        Azure (Source)                                    │
+│   ┌─────────────────────────────────────────────────────────────────┐  │
+│   │ Source VMs                                                       │  │
+│   └─────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+# M4CE Migration Phases
+
+## 5-Phase Migration Lifecycle
+
+```
+┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐
+│ ASSESS  │───►│ PREPARE │───►│ MIGRATE │───►│ CUTOVER │───►│ OPTIMIZE│
+└─────────┘    └─────────┘    └─────────┘    └─────────┘    └─────────┘
+     │              │              │              │              │
+     ▼              ▼              ▼              ▼              ▼
+ Inventory     Set up M4CE    Continuous     Switch        Right-size
+ Dependency    VPN/Peering    Replication    Traffic       Modernize
+ Fit analysis  Test clone     Validation     Retire src    Cost opt
+```
+
+**Timeline per VM:**
+- Assess: 1-2 days
+- Prepare: 1-2 days  
+- Migrate (replication): 1-7 days (depends on data size)
+- Cutover: 15-60 minutes
+- Optimize: Ongoing
+
+---
+
+# Phase 1: Assessment
+
+## Pre-Migration Discovery
+
+```bash
+# Install assessment tools on source VMs
+# Azure: Use M4CE assessment tool or manual inventory
+
+# Key data to collect:
+┌──────────────────────────────────────────────────────────────┐
+│ VM Inventory                                                  │
+├──────────────────────────────────────────────────────────────┤
+│ • OS version and patch level                                 │
+│ • CPU/RAM/Disk utilization (30-day average)                  │
+│ • Disk count, size, and IOPS requirements                    │
+│ • Network interfaces and IPs                                 │
+│ • Installed software and licenses                            │
+│ • Dependencies (DB connections, API calls)                   │
+│ • Backup/DR requirements                                     │
+│ • Compliance requirements (PCI, HIPAA, etc.)                 │
+└──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+# Assessment: Compatibility Matrix
+
+## Supported Source Platforms
+
+| Source | OS | M4CE Support |
+|--------|-----|--------------|
+| Azure | Windows Server 2012 R2+ | ✅ |
+| Azure | Windows Server 2008 R2 | ⚠️ Limited |
+| Azure | Ubuntu 16.04+ | ✅ |
+| Azure | RHEL/CentOS 7+ | ✅ |
+| Azure | Debian 9+ | ✅ |
+| Azure | SUSE 12+ | ✅ |
+
+## Blockers to Identify
+- [ ] 32-bit OS (not supported)
+- [ ] Physical appliances  
+- [ ] Encrypted disks (need keys)
+- [ ] GPU workloads (special handling)
+- [ ] Clustered apps (migrate together)
+
+---
+
+# Assessment: Dependency Mapping
+
+## Critical for Wave Planning
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Application: Order Processing                                            │
+│                                                                         │
+│  ┌─────────┐      ┌─────────┐      ┌─────────┐      ┌─────────┐        │
+│  │ Web VM  │─────►│ App VM  │─────►│ DB VM   │─────►│ Storage │        │
+│  │         │      │         │      │         │      │ Account │        │
+│  └─────────┘      └─────────┘      └─────────┘      └─────────┘        │
+│       │                │                │                               │
+│       │                │                └──────► LDAP (on-prem)        │
+│       │                └──────────────────────► API Gateway            │
+│       └───────────────────────────────────────► CDN                    │
+│                                                                         │
+│  Migration Unit: Web + App + DB (migrate together)                      │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Tool:** Use network flow logs or APM to discover dependencies
+
+---
+
+# Phase 2: Preparation
+
+## Infrastructure Setup Checklist
+
+| Task | Owner | Status |
+|------|-------|--------|
+| VPN/Interconnect established | Network | ☐ |
+| Target VPC and subnets created | Network | ☐ |
+| Firewall rules configured | Security | ☐ |
+| M4CE deployed and configured | Migration | ☐ |
+| Service accounts and IAM set up | Security | ☐ |
+| Target machine types selected | Migration | ☐ |
+| Disk types and sizes planned | Migration | ☐ |
+| DNS strategy documented | Network | ☐ |
+| Monitoring/alerting ready | Ops | ☐ |
+| Rollback procedure documented | Migration | ☐ |
+
+---
+
+# M4CE Setup
+
+## Deploy Migrate Connector
+
+```bash
+# 1. Create service account for M4CE
+gcloud iam service-accounts create m4ce-connector \
+  --display-name="M4CE Connector"
+
+# 2. Grant required roles
+gcloud projects add-iam-policy-binding PROJECT_ID \
+  --member="serviceAccount:m4ce-connector@PROJECT.iam.gserviceaccount.com" \
+  --role="roles/vmmigration.admin"
+
+# 3. Deploy connector in Azure (via Azure Marketplace or OVA)
+# Configure with:
+#   - GCP project ID
+#   - Service account key
+#   - VPN endpoint IPs
+```
+
+---
+
+# Phase 3: Migration (Replication)
+
+## Continuous Data Replication
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│ Timeline                                                                │
+│                                                                        │
+│  Day 1         Day 2         Day 3         Day 4         Day 5        │
+│    │             │             │             │             │           │
+│    ▼             ▼             ▼             ▼             ▼           │
+│  ┌─────────────────────────────────────────────────────────────────┐  │
+│  │▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░░│  │
+│  │ Initial Sync (500 GB)                      │ Delta Sync        │  │
+│  └─────────────────────────────────────────────────────────────────┘  │
+│                                                                        │
+│  Initial sync: ~100 GB/day over VPN (depends on bandwidth)            │
+│  Delta sync: Only changed blocks (minimal bandwidth)                   │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+**Best Practice:** Start replication 5-7 days before cutover
+
+---
+
+# Replication Monitoring
+
+## Track Sync Progress
+
+```bash
+# Check replication status via API or Console
+gcloud alpha migration vms replicating-vms describe VM_NAME \
+  --region=australia-southeast1
+
+# Key metrics to monitor:
+┌──────────────────────────────────────────────────────────┐
+│ Metric                      │ Healthy          │ Alert   │
+├─────────────────────────────┼──────────────────┼─────────┤
+│ Replication lag             │ < 1 hour         │ > 4 hrs │
+│ Data transferred (GB/day)   │ On track         │ Behind  │
+│ Replication errors          │ 0                │ > 0     │
+│ Network throughput          │ Stable           │ Drops   │
+└──────────────────────────────────────────────────────────┘
+```
+
+**Alert Setup:** Cloud Monitoring alerts for replication lag
+
+---
+
+# Test Clone (Pre-Cutover Validation)
+
+## Validate Before Cutover
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Production (Azure)                 │ Test Clone (GCP)                   │
+│                                    │                                    │
+│  ┌─────────────┐                   │  ┌─────────────┐                   │
+│  │ Source VM   │ ──────────────────┼─►│ Clone VM    │ (isolated VPC)   │
+│  │ (running)   │    Snapshot       │  │ (test)      │                   │
+│  └─────────────┘                   │  └─────────────┘                   │
+│                                    │        │                           │
+│                                    │        ▼                           │
+│                                    │  Run validation tests              │
+│                                    │  • App starts successfully         │
+│                                    │  • Can connect to dependencies     │
+│                                    │  • Performance baseline            │
+│                                    │  • Delete after testing            │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Best Practice:** Create test clone 48-72 hours before cutover
+
+---
+
+# Phase 4: Cutover Execution
+
+## Cutover Window Timeline
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Cutover Window: 60 minutes                                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│ T-60   │ Pre-checks: Replication healthy, team ready                    │
+│ T-30   │ Notify stakeholders, war room active                           │
+│ T-15   │ Final delta sync in progress                                   │
+│ T-0    │ STOP source VM                                                 │
+│ T+5    │ Complete final sync (< 5 min for typical delta)                │
+│ T+10   │ Start target VM in GCP                                         │
+│ T+15   │ Validate: App health checks, connectivity                      │
+│ T+20   │ Update DNS/routing to point to GCP                             │
+│ T+30   │ Smoke tests: End-to-end transaction validation                 │
+│ T+45   │ Monitor: Error rates, latency, user feedback                   │
+│ T+60   │ Declare cutover SUCCESS or initiate ROLLBACK                   │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+# Cutover Runbook Template
+
+## Step-by-Step Execution
+
+| Step | Action | Owner | Duration | Rollback |
+|------|--------|-------|----------|----------|
+| 1 | Announce maintenance window | PM | - | - |
+| 2 | Verify replication lag < 15 min | Eng | 5 min | Delay |
+| 3 | Stop source VM | Eng | 2 min | Restart VM |
+| 4 | Wait for final sync | Eng | 5-10 min | - |
+| 5 | Detach and finalize migration | Eng | 5 min | Abort |
+| 6 | Start GCP VM | Eng | 2 min | Stop, restart source |
+| 7 | Validate app health | Eng | 10 min | Rollback |
+| 8 | Update DNS/LB | Eng | 5 min | Revert DNS |
+| 9 | Run smoke tests | QA | 10 min | Rollback |
+| 10 | Confirm success | PM | - | - |
+
+---
+
+# Cutover: DNS Strategy
+
+## Options for Traffic Switchover
+
+```
+Option A: DNS Update (Simple)
+┌─────────────┐         ┌─────────────┐
+│ app.example │ ──TTL──►│ New IP      │
+│ (update A)  │  (wait) │ (GCP VM)    │
+└─────────────┘         └─────────────┘
+Downtime: DNS TTL (set to 60s before cutover)
+
+Option B: Load Balancer (Zero-downtime)
+┌─────────────┐    ┌─────────────────────────────────┐
+│ app.example │───►│ Global LB                       │
+│ (no change) │    │  ├─ Azure backend (weight: 0)   │
+└─────────────┘    │  └─ GCP backend (weight: 100)   │
+                   └─────────────────────────────────┘
+Downtime: Near-zero (health check failover)
+```
+
+**Best Practice:** Lower DNS TTL to 60-300s one week before cutover
+
+---
+
+# Rollback Procedure
+
+## If Cutover Fails
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ ROLLBACK DECISION TREE                                                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Cutover complete ──► App healthy? ──► Yes ──► SUCCESS ✓                │
+│                             │                                           │
+│                             ▼ No                                        │
+│                       Fixable in 15 min?                                │
+│                             │                                           │
+│              ┌──────────────┴──────────────┐                            │
+│              ▼ Yes                         ▼ No                         │
+│         Fix and retry                  ROLLBACK                         │
+│                                            │                            │
+│                                            ▼                            │
+│                              ┌──────────────────────────┐               │
+│                              │ 1. Revert DNS/LB         │               │
+│                              │ 2. Stop GCP VM           │               │
+│                              │ 3. Restart Azure VM      │               │
+│                              │ 4. Verify app healthy    │               │
+│                              │ 5. Post-mortem           │               │
+│                              └──────────────────────────┘               │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+# Rollback: Key Steps
+
+## Rapid Recovery Procedure
+
+```bash
+# 1. Revert DNS (if DNS-based cutover)
+gcloud dns record-sets update app.example.com. \
+  --zone=example-zone \
+  --type=A \
+  --rrdatas="OLD_AZURE_IP" \
+  --ttl=60
+
+# 2. Or revert Load Balancer weights
+gcloud compute backend-services update app-backend \
+  --global \
+  --update-backend-group=azure-neg,weight=100 \
+  --update-backend-group=gcp-mig,weight=0
+
+# 3. Restart source VM (if stopped)
+az vm start --name app-vm --resource-group rg-prod
+
+# 4. Verify Azure app is responding
+curl -I https://app.example.com/health
+```
+
+**Keep Azure running:** 48-72 hours post-cutover minimum
+
+---
+
+# Phase 5: Post-Migration
+
+## Optimization Checklist
+
+| Task | Timeline | Owner |
+|------|----------|-------|
+| Delete source VM (after validation period) | +7 days | Eng |
+| Right-size GCP VM based on metrics | +14 days | Eng |
+| Implement committed use discounts | +30 days | FinOps |
+| Optimize disk types (pd-balanced → pd-ssd?) | +14 days | Eng |
+| Set up Cloud Monitoring dashboards | +1 day | Ops |
+| Configure backup policies | +1 day | Ops |
+| Update CMDB/inventory | +1 day | Ops |
+| Document lessons learned | +7 days | PM |
+
+---
+
+# VM Migration Wave Planning
+
+## Group VMs for Coordinated Cutover
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Wave Planning Matrix                                                     │
+├─────────────────────────────────────────────────────────────────────────┤
+│ Wave 1: Low Risk (Pilot)           │ Wave 2: Medium Risk               │
+│  • Dev/Test environments            │  • Non-critical production        │
+│  • Standalone apps                  │  • Apps with loose dependencies   │
+│  • 2-3 VMs max                      │  • 5-10 VMs                        │
+│  • Timeline: Week 1-2               │  • Timeline: Week 3-4             │
+├─────────────────────────────────────┼───────────────────────────────────┤
+│ Wave 3: Higher Risk                 │ Wave 4: Critical Systems          │
+│  • Production workloads             │  • Core business apps             │
+│  • Apps with dependencies           │  • High-availability required     │
+│  • 10-20 VMs                        │  • Tight cutover windows          │
+│  • Timeline: Week 5-6               │  • Timeline: Week 7-8             │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+# Wave Dependencies
+
+## Migrate in Correct Order
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│   Wave 1                Wave 2                Wave 3                    │
+│   ┌─────┐              ┌─────┐              ┌─────┐                    │
+│   │ DNS │──────────────│ DB  │──────────────│ App │                    │
+│   │     │              │     │              │     │                    │
+│   └─────┘              └─────┘              └─────┘                    │
+│      │                    │                    │                        │
+│      │    Must complete   │    Must complete   │                        │
+│      │    before Wave 2   │    before Wave 3   │                        │
+│      ▼                    ▼                    ▼                        │
+│   Shared services      Databases           Applications                │
+│   first!               before apps!        last!                       │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Common order:** Infra → DBs → Backend → Frontend
+
+---
+
+<!-- _class: lead -->
+
+# Part 8
+## Database Migration Strategy
+### Cloud SQL, AlloyDB, and VM Databases
+
+---
+
+# Database Migration Patterns
+
+| Pattern | Downtime | Complexity | Data Loss Risk |
+|---------|----------|------------|----------------|
+| **DMS Continuous** | Minutes | Low | Very Low |
+| **Native Replication** | Minutes | Medium | Low |
+| **Dump & Restore** | Hours | Low | Medium |
+| **Dual-Write** | Zero | High | Medium |
+| **Blue-Green DB** | Seconds | High | Low |
+
+## Decision Tree
+```
+Can you tolerate any downtime?
+├─ Yes (minutes OK) → DMS or Native Replication
+└─ No (zero downtime) → Dual-Write or Blue-Green
+         └─ Complex, error-prone — avoid if possible
+```
+
+---
+
+# Database Migration Service (DMS)
+
+## GCP's Managed Migration Tool
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Database Migration Service Architecture                                  │
+│                                                                         │
+│  ┌─────────────────┐                        ┌─────────────────┐        │
+│  │ Source DB       │                        │ Target DB       │        │
+│  │ (Azure SQL/PG)  │                        │ (Cloud SQL)     │        │
+│  └────────┬────────┘                        └────────▲────────┘        │
+│           │                                          │                  │
+│           │  ┌─────────────────────────────────────┐ │                  │
+│           └─►│ DMS Migration Job                   │─┘                  │
+│              │  • Initial full load                │                    │
+│              │  • Continuous CDC replication       │                    │
+│              │  • Schema conversion                │                    │
+│              └─────────────────────────────────────┘                    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+# DMS Supported Sources
+
+## Migration Path Matrix
+
+| Source | Target | Method | Notes |
+|--------|--------|--------|-------|
+| Azure SQL | Cloud SQL (SQL Server) | DMS | Full support |
+| Azure PostgreSQL | Cloud SQL (PostgreSQL) | DMS | Full support |
+| Azure PostgreSQL | AlloyDB | DMS | Full support |
+| Azure MySQL | Cloud SQL (MySQL) | DMS | Full support |
+| SQL Server on VM | Cloud SQL | DMS | Requires agent |
+| PostgreSQL on VM | Cloud SQL/AlloyDB | DMS | Requires agent |
+| Oracle | Cloud SQL (PostgreSQL) | Ora2Pg + DMS | Schema conversion |
+| Oracle | Bare Metal | Oracle tools | Lift & shift |
+
+---
+
+# DMS Setup: Step by Step
+
+## 1. Create Connection Profiles
+
+```bash
+# Source connection profile (Azure PostgreSQL)
+gcloud database-migration connection-profiles create azure-postgres \
+  --region=australia-southeast1 \
+  --display-name="Azure PostgreSQL Source" \
+  --postgresql-host=myserver.postgres.database.azure.com \
+  --postgresql-port=5432 \
+  --postgresql-username=admin@myserver \
+  --postgresql-password-file=./password.txt \
+  --postgresql-ssl-config-certificate-file=./azure-ca.pem
+
+# Target connection profile (Cloud SQL)
+gcloud database-migration connection-profiles create cloudsql-target \
+  --region=australia-southeast1 \
+  --display-name="Cloud SQL Target" \
+  --cloudsql-instance=projects/PROJECT/instances/INSTANCE
+```
+
+---
+
+# DMS Setup: Migration Job
+
+## 2. Create and Start Migration
+
+```bash
+# Create migration job
+gcloud database-migration migration-jobs create azure-to-gcp \
+  --region=australia-southeast1 \
+  --display-name="Azure PG to Cloud SQL" \
+  --source=azure-postgres \
+  --destination=cloudsql-target \
+  --type=CONTINUOUS \
+  --dump-parallel-level=MAX
+
+# Start the migration (begins initial full load)
+gcloud database-migration migration-jobs start azure-to-gcp \
+  --region=australia-southeast1
+
+# Monitor progress
+gcloud database-migration migration-jobs describe azure-to-gcp \
+  --region=australia-southeast1 \
+  --format="table(name,state,phase,error)"
+```
+
+---
+
+# DMS Migration Phases
+
+## Timeline Visualization
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Migration Timeline                                                       │
+│                                                                         │
+│  ┌─────────────┐ ┌─────────────────────────────┐ ┌─────────┐ ┌───────┐ │
+│  │ Full Dump   │ │ CDC Replication             │ │ Promote │ │ Done  │ │
+│  │ (hours-days)│ │ (continuous, lag < 1 min)   │ │ (mins)  │ │       │ │
+│  └─────────────┘ └─────────────────────────────┘ └─────────┘ └───────┘ │
+│                                                                         │
+│  Phase 1: FULL_DUMP        Phase 2: CDC           Phase 3: PROMOTE     │
+│  • Schema creation         • Real-time changes    • Stop source writes │
+│  • Initial data load       • Low latency sync     • Final sync         │
+│  • Can take hours          • Monitor lag          • Promote replica    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+# Data Validation
+
+## Verify Data Integrity
+
+```bash
+# Built-in DMS validation
+gcloud database-migration migration-jobs verify azure-to-gcp \
+  --region=australia-southeast1
+
+# Manual validation queries
+# Run on BOTH source and target, compare results:
+
+# Row counts per table
+SELECT table_name, 
+       (xpath('/row/count/text()', 
+        query_to_xml('SELECT COUNT(*) FROM '||table_name, false, true, '')))[1]::text::int AS row_count
+FROM information_schema.tables 
+WHERE table_schema = 'public';
+
+# Checksum critical tables
+SELECT md5(array_agg(t.*)::text) AS checksum 
+FROM (SELECT * FROM orders ORDER BY id) t;
+```
+
+---
+
+# Validation Checklist
+
+## Pre-Cutover Data Verification
+
+| Check | Method | Pass Criteria |
+|-------|--------|---------------|
+| Row counts match | SQL query | 100% match |
+| Schema identical | pg_dump --schema-only | Diff = 0 |
+| Primary keys | Query | All present |
+| Foreign keys | Query | All valid |
+| Indexes | Query | All created |
+| Sequences | Query | Current values match |
+| Triggers/Functions | Query | All migrated |
+| Permissions | Query | Roles configured |
+| Sample data spot-check | Manual | Correct |
+
+---
+
+# Database Cutover Procedure
+
+## Promotion Runbook
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ DATABASE CUTOVER TIMELINE (30-45 minutes)                                │
+├─────────────────────────────────────────────────────────────────────────┤
+│ T-30  │ Verify replication lag < 1 minute                               │
+│ T-20  │ Notify stakeholders, freeze deployments                         │
+│ T-10  │ Run final validation checks                                     │
+│ T-5   │ Prepare connection string updates                               │
+│ T-0   │ STOP application writes to source DB                            │
+│ T+2   │ Wait for replication to catch up (lag = 0)                      │
+│ T+5   │ Promote DMS migration (makes target primary)                    │
+│ T+10  │ Update application connection strings                           │
+│ T+15  │ Restart applications with new connection                        │
+│ T+20  │ Smoke test: Verify reads AND writes work                        │
+│ T+30  │ Monitor error rates and query performance                       │
+│ T+45  │ Declare SUCCESS or ROLLBACK                                     │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+# Connection String Cutover
+
+## Options for Switching Applications
+
+```yaml
+# Option A: Direct Update (requires app restart)
+# Before:
+DATABASE_URL: "postgresql://user:pass@azure-server.postgres.database.azure.com/orders"
+# After:
+DATABASE_URL: "postgresql://user:pass@10.2.100.5/orders"  # Cloud SQL private IP
+
+# Option B: DNS CNAME (no app restart needed)
+# db.internal.example.com → azure-server.postgres.database.azure.com
+# Cutover: Update CNAME to Cloud SQL private IP
+# db.internal.example.com → 10.2.100.5
+
+# Option C: Connection Proxy (Cloud SQL Auth Proxy)
+# App connects to localhost:5432 → Proxy → Cloud SQL
+# Cutover: Proxy already points to Cloud SQL
+```
+
+**Recommendation:** Use internal DNS CNAMEs for zero-downtime switchover
+
+---
+
+# Database Rollback Strategy
+
+## If Cutover Fails
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ ROLLBACK DECISION                                                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ⚠️  CRITICAL: Once apps write to new DB, rollback is COMPLEX           │
+│                                                                         │
+│  Scenario 1: Cutover failed BEFORE any writes to new DB                 │
+│  ────────────────────────────────────────────────────────────────────── │
+│  → Simple: Revert connection strings, restart apps                      │
+│  → Source DB unchanged, no data loss                                    │
+│                                                                         │
+│  Scenario 2: Cutover failed AFTER writes to new DB                      │
+│  ────────────────────────────────────────────────────────────────────── │
+│  → Complex: Must migrate delta data back to source                      │
+│  → Options:                                                             │
+│    a) Forward-fix in GCP (preferred)                                    │
+│    b) Set up reverse replication (DMS target→source)                    │
+│    c) Accept brief data loss, restore source from backup                │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+# Minimizing Rollback Risk
+
+## Best Practices
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Risk Mitigation Strategies                                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│ 1. READ-ONLY PERIOD                                                     │
+│    • Cut over reads first (app reads from GCP)                          │
+│    • Keep writes on source for 24-48 hours                              │
+│    • Then cut over writes when confident                                │
+│                                                                         │
+│ 2. FEATURE FLAGS                                                        │
+│    • Use feature flags to control DB routing                            │
+│    • Instant rollback without deployment                                │
+│                                                                         │
+│ 3. CANARY TRAFFIC                                                       │
+│    • Route 5% of connections to new DB                                  │
+│    • Monitor for errors before full cutover                             │
+│                                                                         │
+│ 4. BACKUP BEFORE PROMOTE                                                │
+│    • Take final backup of source DB                                     │
+│    • Point-in-time recovery option if needed                            │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+# Native Replication Alternative
+
+## PostgreSQL: pglogical / Logical Replication
+
+```bash
+# Source (Azure PostgreSQL) - Enable logical replication
+# Requires: azure.replication_support = logical
+
+# On source:
+CREATE PUBLICATION orders_pub FOR TABLE orders, customers, products;
+
+# On target (Cloud SQL):
+CREATE SUBSCRIPTION orders_sub
+  CONNECTION 'host=azure-server.postgres.database.azure.com 
+              port=5432 
+              dbname=orders 
+              user=replication_user'
+  PUBLICATION orders_pub;
+
+# Monitor replication lag
+SELECT 
+  slot_name,
+  pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS lag
+FROM pg_replication_slots;
+```
+
+---
+
+# Native Replication: MySQL
+
+## GTID-Based Replication
+
+```sql
+-- Source (Azure MySQL) - Enable GTID
+-- Requires: gtid_mode = ON, enforce_gtid_consistency = ON
+
+-- On target (Cloud SQL for MySQL):
+CALL mysql.setupExternalReplication(
+  'azure-server.mysql.database.azure.com',  -- host
+  3306,                                       -- port
+  'replication_user',                         -- user
+  'password',                                 -- password
+  '',                                         -- binlog file (empty for GTID)
+  0,                                          -- binlog pos
+  TRUE                                        -- use GTID
+);
+
+-- Start replication
+CALL mysql.startReplication();
+
+-- Check status
+CALL mysql.showReplicationStatus();
+```
+
+---
+
+# AlloyDB Migration
+
+## DMS to AlloyDB
+
+```bash
+# Create AlloyDB cluster first
+gcloud alloydb clusters create orders-cluster \
+  --region=australia-southeast1 \
+  --password=SECURE_PASSWORD \
+  --network=shared-vpc
+
+# Create primary instance
+gcloud alloydb instances create orders-primary \
+  --cluster=orders-cluster \
+  --region=australia-southeast1 \
+  --instance-type=PRIMARY \
+  --cpu-count=8
+
+# Create DMS migration job to AlloyDB
+gcloud database-migration migration-jobs create azure-to-alloydb \
+  --region=australia-southeast1 \
+  --source=azure-postgres \
+  --destination-alloydb-cluster=orders-cluster \
+  --type=CONTINUOUS
+```
+
+---
+
+# VM Database Migration
+
+## Self-Managed DB Cutover
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ VM-to-VM Database Migration (PostgreSQL example)                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Option A: Streaming Replication                                        │
+│  ────────────────────────────────────────────────────────────────────── │
+│  1. Set up GCP VM with PostgreSQL                                       │
+│  2. Configure as streaming replica of Azure source                      │
+│  3. Cutover: Promote GCP replica to primary                             │
+│  4. Downtime: ~1-2 minutes                                              │
+│                                                                         │
+│  Option B: pg_dump / pg_restore                                         │
+│  ────────────────────────────────────────────────────────────────────── │
+│  1. pg_dump on source (with --format=directory for parallelism)         │
+│  2. Transfer dump to GCP (gsutil or direct copy)                        │
+│  3. pg_restore on target                                                │
+│  4. Downtime: Hours (depends on size)                                   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+# Streaming Replication Setup
+
+## Azure VM → GCP VM (PostgreSQL)
+
+```bash
+# On Source (Azure VM) - postgresql.conf
+wal_level = replica
+max_wal_senders = 5
+wal_keep_size = 1GB
+
+# On Source - pg_hba.conf
+host replication replicator 10.2.0.0/16 scram-sha-256
+
+# On Target (GCP VM) - Initial base backup
+pg_basebackup -h azure-db-vm -U replicator \
+  -D /var/lib/postgresql/15/main -Fp -Xs -P -R
+
+# On Target - Start PostgreSQL (will follow source)
+systemctl start postgresql
+
+# Verify replication
+psql -c "SELECT * FROM pg_stat_wal_receiver;"
+```
+
+---
+
+# Cutover: Promote Replica
+
+## Streaming Replication Promotion
+
+```bash
+# Pre-cutover checklist
+psql -c "SELECT pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn();"
+# Ensure both LSNs match (replica is caught up)
+
+# 1. Stop applications writing to source
+systemctl stop myapp
+
+# 2. Final sync check (wait for lag = 0)
+watch -n 1 "psql -c \"SELECT pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()) AS lag_bytes;\""
+
+# 3. Promote replica to primary
+pg_ctl promote -D /var/lib/postgresql/15/main
+# Or: SELECT pg_promote();
+
+# 4. Verify it's now primary
+psql -c "SELECT pg_is_in_recovery();"  # Should return 'f' (false)
+
+# 5. Update application connection strings to GCP VM
+# 6. Start applications
+```
+
+---
+
+# Large Database Considerations
+
+## Strategies for Multi-TB Databases
+
+| Strategy | Use Case | Notes |
+|----------|----------|-------|
+| **Parallel dump/restore** | < 1 TB, can tolerate hours | pg_dump -j 8 |
+| **Streaming replication** | Any size, minutes downtime | Recommended |
+| **DMS continuous** | Managed DBs, any size | Easiest |
+| **Physical backup + ship** | Very large, limited bandwidth | Ship disks |
+| **Incremental approach** | > 10 TB | Initial + catchup |
+
+```bash
+# Parallel pg_dump for faster export
+pg_dump -h source -U admin -d orders \
+  --format=directory \
+  --jobs=8 \
+  --file=/backup/orders_dump
+
+# Parallel pg_restore on target
+pg_restore -h target -U admin -d orders \
+  --jobs=8 \
+  /backup/orders_dump
+```
+
+---
+
+# Database Migration Checklist
+
+## Comprehensive Pre-Cutover List
+
+| Category | Check | Status |
+|----------|-------|--------|
+| **Schema** | All tables migrated | ☐ |
+| **Schema** | All indexes created | ☐ |
+| **Schema** | All constraints valid | ☐ |
+| **Schema** | Sequences at correct values | ☐ |
+| **Data** | Row counts match | ☐ |
+| **Data** | Checksums match (sample) | ☐ |
+| **Replication** | Lag < 1 minute | ☐ |
+| **Performance** | Query plans acceptable | ☐ |
+| **Connectivity** | Apps can connect | ☐ |
+| **Auth** | IAM/passwords configured | ☐ |
+| **Backup** | Final source backup taken | ☐ |
+| **Rollback** | Procedure documented | ☐ |
+
+---
+
+# Post-Migration Database Tasks
+
+## Don't Forget These!
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Post-Cutover Checklist                                                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│ Immediate (Day 1):                                                      │
+│ ☐ Update ANALYZE statistics (for query planner)                         │
+│ ☐ Verify automated backups configured                                   │
+│ ☐ Set up Cloud Monitoring alerts                                        │
+│ ☐ Verify point-in-time recovery works                                   │
+│                                                                         │
+│ Short-term (Week 1):                                                    │
+│ ☐ Monitor query performance vs baseline                                 │
+│ ☐ Right-size instance based on actual usage                             │
+│ ☐ Delete source database (after validation period)                      │
+│ ☐ Update documentation and runbooks                                     │
+│                                                                         │
+│ Long-term (Month 1):                                                    │
+│ ☐ Review and optimize slow queries                                      │
+│ ☐ Consider read replicas if needed                                      │
+│ ☐ Evaluate committed use discounts                                      │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 # Summary & Recommendations
 
 | Topic | Recommendation |
