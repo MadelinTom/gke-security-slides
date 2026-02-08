@@ -359,133 +359,469 @@ gcloud compute networks subnets update gke-subnet \
 
 ---
 
-# Cutover Patterns
+# The Microservices Migration Problem
 
-## Option A: Big Bang 💥
-- All apps cut over at once
-- Single maintenance window
-- High risk, high coordination
-
-## Option B: Strangler Fig 🌿 (Recommended)
-- Migrate one app at a time
-- Route traffic progressively
-- Rollback per-app if needed
-
-## Option C: Blue-Green 🔵🟢
-- Full parallel environment
-- DNS switch at cutover
-- Highest cost, lowest risk
-
----
-
-# Strangler Fig Pattern
+## Why Simple Traffic Splitting Doesn't Work
 
 ```
-Phase 1: 10% Traffic          Phase 2: 50% Traffic         Phase 3: 100% Traffic
-┌──────────────────┐          ┌──────────────────┐         ┌──────────────────┐
-│   Load Balancer  │          │   Load Balancer  │         │   Load Balancer  │
-└────────┬─────────┘          └────────┬─────────┘         └────────┬─────────┘
-         │                             │                            │
-    ┌────┴────┐                   ┌────┴────┐                       │
-    ▼         ▼                   ▼         ▼                       ▼
-┌──────┐  ┌──────┐           ┌──────┐  ┌──────┐              ┌──────────┐
-│Azure │  │ GCP  │           │Azure │  │ GCP  │              │   GCP    │
-│ 90%  │  │ 10%  │           │ 50%  │  │ 50%  │              │  100%    │
-└──────┘  └──────┘           └──────┘  └──────┘              └──────────┘
-```
+❌ NAIVE APPROACH: Split traffic per-service independently
 
-**Tools:** Traffic Manager (Azure), Cloud Load Balancing, Weighted routing
-
----
-
-# API Cutover Strategy
-
-## Per-API Migration Runbook
-
-| Step | Action | Rollback |
-|------|--------|----------|
-| 1 | Deploy to GKE (shadow mode) | Delete deployment |
-| 2 | Synthetic traffic testing | N/A |
-| 3 | 10% canary traffic | Route 100% Azure |
-| 4 | Monitor error rates/latency | Route 100% Azure |
-| 5 | 50% traffic split | Route 100% Azure |
-| 6 | 100% to GCP | Route 100% Azure |
-| 7 | Decommission Azure | N/A |
-
-**Monitoring:** Error rate < 0.1%, P99 latency within SLO
-
----
-
-# Traffic Routing Options
-
-## Option 1: DNS-Based (Simple)
-
-```
-api.example.com
+User Request
     │
-    ▼
-┌─────────────────────────────┐
-│ Azure Traffic Manager       │
-│ or                          │
-│ Cloud DNS (weighted routing)│
-└─────────────────────────────┘
-    │
-    ├──► Azure App Service (weight: 50)
-    │
-    └──► GCP Load Balancer (weight: 50)
+    ▼ (50% to GCP)
+┌─────────────────┐
+│ Orders (GCP)    │────────────────┐
+└─────────────────┘                │
+                                   ▼ (VPN round-trip: +50ms)
+                          ┌─────────────────┐
+                          │ Inventory (Azure)│───────────┐
+                          └─────────────────┘            │
+                                                         ▼ (VPN: +50ms)
+                                                ┌─────────────────┐
+                                                │ Payments (GCP)  │
+                                                └─────────────────┘
+
+Total added latency: 100ms+ per request (ping-ponging across clouds)
 ```
 
-**Pros:** Simple, works everywhere
-**Cons:** DNS TTL delays, no request-level control
+**Problems:** Latency compounds, distributed tracing breaks, partial failures cascade
 
 ---
 
-# Traffic Routing Options
+# Microservices Cutover Patterns
 
-## Option 2: Global Load Balancer (Recommended)
+## Choose Based on Coupling
+
+| Pattern | Best For | Complexity | Risk |
+|---------|----------|------------|------|
+| **Domain Cluster** | Tightly coupled services | Medium | Low |
+| **Parallel Stack** | Full environment clone | High | Lowest |
+| **Strangler + Facade** | Loosely coupled, API-driven | Medium | Medium |
+| **Service Mesh Bridge** | Complex interdependencies | High | Medium |
+| **Big Bang per Domain** | Bounded contexts | Low | Higher |
+
+## 💬 Key Question
+*"Which services MUST be migrated together vs. can be decoupled?"*
+
+---
+
+# Pattern 1: Domain Cluster Migration
+
+## Migrate Tightly-Coupled Services Together
 
 ```
-                    ┌────────────────────────┐
-                    │ GCP Global LB          │
-                    │ (External HTTP(S))     │
-                    └───────────┬────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│ DOMAIN: Order Processing (migrate as single unit)                        │
+│                                                                         │
+│   ┌─────────┐     ┌───────────┐     ┌──────────┐     ┌───────────┐    │
+│   │ Orders  │────►│ Inventory │────►│ Payments │────►│ Shipping  │    │
+│   │ Service │     │ Service   │     │ Service  │     │ Service   │    │
+│   └─────────┘     └───────────┘     └──────────┘     └───────────┘    │
+│        │                                   │                           │
+│        └───────────────┬───────────────────┘                           │
+│                        ▼                                               │
+│                 ┌─────────────┐                                        │
+│                 │ Orders DB   │                                        │
+│                 └─────────────┘                                        │
+└─────────────────────────────────────────────────────────────────────────┘
+                         │
+                         ▼ Migrate entire cluster at once
+┌─────────────────────────────────────────────────────────────────────────┐
+│ GKE Cluster (all Order Processing services)                              │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Cutover:** All services in domain switch together (shorter window, atomic)
+
+---
+
+# Identifying Domain Clusters
+
+## Mapping Service Affinity
+
+```
+Step 1: Build Dependency Graph
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│    ┌─────────┐ sync  ┌───────────┐ sync  ┌──────────┐                  │
+│    │ Orders  │──────►│ Inventory │──────►│ Payments │                  │
+│    └────┬────┘       └─────┬─────┘       └────┬─────┘                  │
+│         │                  │                   │                        │
+│         │ async            │ sync              │ sync                   │
+│         ▼                  ▼                   ▼                        │
+│    ┌─────────┐       ┌───────────┐       ┌──────────┐                  │
+│    │ Notif.  │       │ Warehouse │       │ Ledger   │                  │
+│    └─────────┘       └───────────┘       └──────────┘                  │
+│                                                                         │
+│ Step 2: Identify Clusters (sync dependencies = same cluster)           │
+│                                                                         │
+│    Cluster A: Orders, Inventory, Payments, Warehouse, Ledger           │
+│    Cluster B: Notifications (async, can migrate separately)            │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**Rule:** Synchronous dependencies = migrate together
+
+---
+
+# Pattern 2: Parallel Stack (Blue-Green)
+
+## Full Environment, Then Switch
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           DURING MIGRATION                               │
+│                                                                         │
+│  ┌─────────────────────────┐        ┌─────────────────────────┐        │
+│  │ AZURE (Blue - Active)   │        │ GCP (Green - Standby)   │        │
+│  │                         │        │                         │        │
+│  │  ┌───┐ ┌───┐ ┌───┐     │        │  ┌───┐ ┌───┐ ┌───┐     │        │
+│  │  │ A │─│ B │─│ C │     │        │  │ A │─│ B │─│ C │     │        │
+│  │  └───┘ └───┘ └───┘     │        │  └───┘ └───┘ └───┘     │        │
+│  │       ┌─────┐          │        │       ┌─────┐          │        │
+│  │       │ DB  │──────────┼────────┼──────►│ DB  │ (sync)   │        │
+│  │       └─────┘          │        │       └─────┘          │        │
+│  │                        │        │                         │        │
+│  │      100% traffic      │        │  Shadow/test traffic    │        │
+│  └─────────────────────────┘        └─────────────────────────┘        │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+CUTOVER: DNS/LB switch moves 100% traffic to GCP atomically
+```
+
+**Pro:** Cleanest cutover, no cross-cloud service calls
+**Con:** Highest cost (full duplicate infrastructure)
+
+---
+
+# Parallel Stack: Cutover Sequence
+
+## Atomic Switch with Validation
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ PARALLEL STACK CUTOVER TIMELINE                                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│ Week -4  │ Deploy all services to GKE (not serving traffic)            │
+│ Week -3  │ Set up DB replication (Azure → GCP)                          │
+│ Week -2  │ Shadow traffic: mirror requests to GCP, compare responses    │
+│ Week -1  │ Fix any discrepancies found in shadow testing               │
+│          │                                                              │
+│ Day -1   │ Final validation, stakeholder sign-off                       │
+│ Hour -2  │ Announce maintenance window                                  │
+│ Hour -1  │ Stop writes to Azure (read-only mode)                        │
+│ Minute 0 │ Wait for DB sync to complete (lag = 0)                       │
+│ Minute 5 │ Promote GCP DB to primary                                    │
+│ Minute 10│ Switch DNS/LB to GCP                                         │
+│ Minute 15│ Validate all services responding                             │
+│ Minute 30│ Declare success or rollback                                  │
+│          │                                                              │
+│ Day +1-3 │ Monitor, keep Azure warm for rollback                        │
+│ Day +7   │ Decommission Azure                                           │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+# Pattern 3: Strangler with API Facade
+
+## Decouple via Gateway
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      API GATEWAY / FACADE                                │
+│                      (Single entry point)                                │
+│  ┌───────────────────────────────────────────────────────────────────┐  │
+│  │  Route: /orders/*  → GCP                                          │  │
+│  │  Route: /inventory/* → Azure (not migrated yet)                   │  │
+│  │  Route: /payments/* → GCP                                         │  │
+│  └───────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
+                │                               │
+      ┌─────────┴─────────┐           ┌─────────┴─────────┐
+      ▼                   ▼           ▼                   ▼
+┌───────────────┐   ┌───────────────┐   ┌───────────────┐
+│ GCP Cluster   │   │ Azure Cluster │   │ GCP Cluster   │
+│ ┌─────────┐   │   │ ┌───────────┐ │   │ ┌──────────┐  │
+│ │ Orders  │───┼───┼─│ Inventory │─┼───┼─│ Payments │  │
+│ └─────────┘   │   │ └───────────┘ │   │ └──────────┘  │
+└───────────────┘   └───────────────┘   └───────────────┘
+```
+
+**Key:** Services call facade, not each other directly
+**Trade-off:** Added latency through gateway, but enables gradual migration
+
+---
+
+# Pattern 3: Making Strangler Work
+
+## Requirements for Gradual Migration
+
+| Requirement | Why | How |
+|-------------|-----|-----|
+| **Service Discovery** | Services must find each other across clouds | Consul, DNS, or API Gateway routing |
+| **Cross-Cloud Auth** | Requests must authenticate across boundary | Shared JWT, mTLS, or federation |
+| **Consistent Routing** | Same request → same cloud for consistency | Header-based affinity (session ID) |
+| **Observability** | Trace requests across clouds | Distributed tracing (Jaeger, Zipkin) |
+
+```yaml
+# Example: Envoy sidecar routing config
+routes:
+  - match: { prefix: "/api/inventory" }
+    route:
+      cluster: azure-inventory  # Still on Azure
+  - match: { prefix: "/api/orders" }
+    route:
+      cluster: gke-orders  # Migrated to GCP
+```
+
+---
+
+# Pattern 4: Service Mesh Bridge
+
+## Istio Multi-Cluster for Cross-Cloud
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        ISTIO CONTROL PLANE                               │
+│                   (Shared config across clouds)                          │
+└───────────────────────────────┬─────────────────────────────────────────┘
                                 │
-                    ┌───────────┴───────────┐
-                    │   Traffic Director    │
-                    │   (header/weight)     │
-                    └───────────┬───────────┘
-                                │
-              ┌─────────────────┼─────────────────┐
-              ▼                 ▼                 ▼
-    ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
-    │ Azure Backend   │ │ GKE Backend     │ │ GKE Backend     │
-    │ (NEG)           │ │ (orders)        │ │ (inventory)     │
-    └─────────────────┘ └─────────────────┘ └─────────────────┘
+        ┌───────────────────────┴───────────────────────┐
+        ▼                                               ▼
+┌─────────────────────────┐                ┌─────────────────────────┐
+│ Azure AKS               │                │ GCP GKE                 │
+│                         │                │                         │
+│ ┌─────────────────────┐ │    Mesh        │ ┌─────────────────────┐ │
+│ │ Istio East-West GW  │◄┼────────────────┼►│ Istio East-West GW  │ │
+│ └─────────────────────┘ │                │ └─────────────────────┘ │
+│          │              │                │          │              │
+│ ┌────────┴────────┐     │                │ ┌────────┴────────┐     │
+│ │ Orders (envoy)  │     │                │ │ Payments (envoy)│     │
+│ │ Inventory       │     │                │ │ Shipping        │     │
+│ └─────────────────┘     │                │ └─────────────────┘     │
+└─────────────────────────┘                └─────────────────────────┘
 ```
 
-**Pros:** Request-level routing, header-based canary, single IP
+**Pro:** Transparent service-to-service routing across clouds
+**Con:** Complexity of multi-cluster mesh, latency for cross-cloud calls
 
 ---
 
-# Cutover Checklist
+# Traffic Management: Session Affinity
 
-## Pre-Cutover
-- [ ] Synthetic tests passing on GCP
-- [ ] Monitoring/alerting configured
-- [ ] Runbook documented
-- [ ] Rollback tested
-- [ ] Stakeholder comms sent
+## Keep Related Requests Together
 
-## During Cutover
-- [ ] Start with 10% traffic
-- [ ] Monitor for 30 mins
-- [ ] Increment to 50%, monitor
-- [ ] Increment to 100%
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ PROBLEM: Request fan-out across clouds                                   │
+│                                                                         │
+│  User A request → Orders (GCP) → Inventory (Azure) → Payments (GCP)    │
+│  User B request → Orders (Azure) → Inventory (GCP) → Payments (Azure)  │
+│                                                                         │
+│  = Chaos, unpredictable latency, hard to debug                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│ SOLUTION: Session/Request Affinity                                       │
+│                                                                         │
+│  X-Migration-Target: gcp  (header on ingress)                           │
+│                                                                         │
+│  User A request → ALL downstream calls go to GCP versions              │
+│  User B request → ALL downstream calls go to Azure versions            │
+│                                                                         │
+│  = Predictable paths, easier rollback per-user cohort                  │
+└─────────────────────────────────────────────────────────────────────────┘
+```
 
-## Post-Cutover
-- [ ] Confirm all traffic on GCP
-- [ ] Keep Azure running 48-72h
-- [ ] Decommission Azure resources
+**Implementation:** Set header at edge, propagate through service mesh
+
+---
+
+# Traffic Splitting: Cohort-Based
+
+## Split by User Segment, Not Percentage
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ Instead of: 10% random traffic to GCP                                    │
+│ Use:        10% of USERS to GCP (all their requests)                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Phase 1: Internal users only → GCP                                     │
+│  Phase 2: Internal + beta customers → GCP                               │
+│  Phase 3: Internal + beta + 10% of region A → GCP                      │
+│  Phase 4: Region A fully → GCP                                          │
+│  Phase 5: All regions → GCP                                             │
+│                                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│ ROUTING LOGIC (at edge/gateway):                                        │
+│                                                                         │
+│  if user.is_internal:                                                   │
+│      route_to = "gcp"                                                   │
+│  elif user.id in beta_cohort:                                           │
+│      route_to = "gcp"                                                   │
+│  elif hash(user.id) % 100 < rollout_percentage:                        │
+│      route_to = "gcp"                                                   │
+│  else:                                                                  │
+│      route_to = "azure"                                                 │
+│                                                                         │
+│  # Propagate choice to all downstream services                          │
+│  headers["X-Target-Cloud"] = route_to                                   │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+# Handling Cross-Cloud Calls
+
+## When Services MUST Communicate Across Clouds
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ SCENARIO: Orders (GCP) must call Auth Service (still on Azure)          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│ Option A: Direct Call (Accept Latency)                                  │
+│ ──────────────────────────────────────                                  │
+│   Orders (GCP) ──VPN──► Auth (Azure)                                    │
+│   Latency: +30-50ms per call                                            │
+│   Use when: Auth is called once per request, not in hot path            │
+│                                                                         │
+│ Option B: Cache/Replicate                                               │
+│ ─────────────────────────                                               │
+│   Auth tokens cached in GCP (Redis/Memorystore)                         │
+│   Async sync from Azure Auth → GCP cache                                │
+│   Use when: Data is cacheable, eventual consistency OK                  │
+│                                                                         │
+│ Option C: Deploy Both Sides                                             │
+│ ───────────────────────────                                             │
+│   Auth Service runs in BOTH Azure AND GCP                               │
+│   Shared database or sync between them                                  │
+│   Use when: Critical path, can't accept latency                         │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+# Migration Sequence for Microservices
+
+## Recommended Order
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ WAVE 0: Foundation                                                       │
+│ ─────────────────                                                        │
+│ VPN, Networking, IAM, Shared Services (Auth, Logging, Config)           │
+│                                                                         │
+│ WAVE 1: Leaf Services (No Downstream Dependencies)                      │
+│ ──────────────────────────────────────────────────                      │
+│ Notification, Email, PDF Generator, Export Services                     │
+│ These can call INTO the old system but nothing calls them               │
+│                                                                         │
+│ WAVE 2: Shared Data Services                                            │
+│ ────────────────────────────                                            │
+│ Databases, Caches, Message Queues                                       │
+│ Set up replication, run dual-write if needed                            │
+│                                                                         │
+│ WAVE 3: Core Domain Clusters                                            │
+│ ────────────────────────────                                            │
+│ Migrate tightly-coupled service groups together                         │
+│ Orders+Inventory+Payments as a unit                                     │
+│                                                                         │
+│ WAVE 4: Edge/Entry Services                                             │
+│ ───────────────────────────                                             │
+│ API Gateways, Web Frontends, Mobile Backends                            │
+│ These control traffic routing - migrate last for control                │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+# Rollback Strategy for Microservices
+
+## Granular vs. Full Rollback
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│ ROLLBACK OPTIONS                                                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│ Level 1: User Cohort Rollback                                           │
+│ ─────────────────────────────                                           │
+│ Move affected user segment back to Azure                                │
+│ Other users stay on GCP                                                 │
+│ Fastest, lowest impact                                                  │
+│                                                                         │
+│ Level 2: Service Rollback                                               │
+│ ─────────────────────────                                               │
+│ Route specific service back to Azure                                    │
+│ Requires cross-cloud calls (accept latency)                             │
+│ Use when: Single service has issues                                     │
+│                                                                         │
+│ Level 3: Domain Rollback                                                │
+│ ────────────────────────                                                │
+│ Roll back entire domain cluster                                         │
+│ Clean boundaries, no cross-cloud for that domain                        │
+│ Use when: Cluster has issues                                            │
+│                                                                         │
+│ Level 4: Full Rollback                                                  │
+│ ──────────────────────                                                  │
+│ All traffic back to Azure                                               │
+│ Requires DB sync back (if writes happened on GCP)                       │
+│ Use when: Systemic issues, catastrophic failure                         │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+# Pre-Migration Checklist: Microservices
+
+## Critical Preparation
+
+| Check | Why | Done |
+|-------|-----|------|
+| **Dependency map complete** | Know what calls what | ☐ |
+| **Sync vs async identified** | Determines cluster boundaries | ☐ |
+| **Cross-cloud latency tested** | Validate VPN performance | ☐ |
+| **Service discovery strategy** | How services find each other | ☐ |
+| **Auth token propagation** | Cross-cloud authentication | ☐ |
+| **Distributed tracing** | Debug cross-cloud requests | ☐ |
+| **Cohort routing implemented** | Header-based affinity | ☐ |
+| **Rollback tested per level** | All levels exercised | ☐ |
+| **Data sync verified** | DB replication lag acceptable | ☐ |
+| **Shadow traffic validated** | Responses match between clouds | ☐ |
+
+---
+
+# Cutover Checklist: Microservices
+
+## Execution Day
+
+**Pre-Cutover (T-24h to T-0):**
+- [ ] All services deployed and healthy on GCP
+- [ ] Shadow traffic showing <0.1% error delta
+- [ ] DB replication lag < 1 minute
+- [ ] Monitoring dashboards ready (side-by-side)
+- [ ] War room scheduled, stakeholders notified
+- [ ] Rollback runbook reviewed with team
+
+**During Cutover:**
+- [ ] Switch internal users first (canary)
+- [ ] Monitor for 30 mins, check traces
+- [ ] Add beta cohort, monitor
+- [ ] Increment by region/percentage
+- [ ] Watch for: error rates, latency P99, queue depths
+
+**Post-Cutover:**
+- [ ] All traffic on GCP confirmed
+- [ ] No cross-cloud service calls (except planned)
+- [ ] Keep Azure warm 48-72h for rollback
+- [ ] Document lessons learned
 
 ---
 
